@@ -86,21 +86,15 @@ class Neo4jConnector:
         return "Unknown", 0.0, []
 
     async def find_semantic_route(self, start_id: str, target_name: str, avoid: list):
-        """
-        Constructs a dynamic Cypher query based on LLM constraints
-        to find the shortest semantic path in the Knowledge Graph.
-        """
         rel_types = ["HAS_EXIT", "CONNECTS_TO"]
-        
-        # Check constraints safely without list comprehensions to avoid syntax UI bugs
         avoid_str = str(avoid).lower()
         if "stairs" not in avoid_str:
             rel_types.append("CONNECTS_VIA_STAIRS")
         if "elevator" not in avoid_str and "lift" not in avoid_str:
             rel_types.append("CONNECTS_VIA_ELEVATOR")
-            
         rel_string = "|".join(rel_types)
 
+        # Primary: exact CONTAINS match
         query = f"""
         MATCH (start:Space {{poi_id: $start_id}})
         MATCH (end:Space) WHERE toLower(end.name) CONTAINS toLower($target_name)
@@ -113,14 +107,51 @@ class Neo4jConnector:
         }}] AS route, length(path) AS total_hops
         ORDER BY total_hops ASC LIMIT 1
         """
-        
         async with self.driver.session() as session:
             result = await session.run(query, start_id=start_id, target_name=target_name)
             record = await result.single()
             if record:
                 return record["route"]
+
+        # Fallback 1: individual meaningful words
+        STOP_WORDS = {
+            "the", "a", "an", "to", "get", "find", "go", "take", "me",
+            "i", "want", "need", "please", "can", "you", "how", "where",
+            "is", "are", "room", "floor", "building", "nearest", "closest"
+        }
+        words = [w for w in target_name.lower().split() if len(w) > 3 and w not in STOP_WORDS]
+        for word in words:
+            async with self.driver.session() as session:
+                result = await session.run(query, start_id=start_id, target_name=word)
+                record = await result.single()
+                if record:
+                    return record["route"]
+
+        # Fallback 2: progressive prefix truncation (e.g. "glassale" → "glassal" → "glassa")
+        # Useful when the stored name is a substring of what the user typed, or vice versa
+        cleaned = target_name.strip().lower()
+        if len(cleaned) > 5:
+            for prefix_len in range(len(cleaned) - 1, 4, -1):
+                prefix = cleaned[:prefix_len]
+                async with self.driver.session() as session:
+                    result = await session.run(query, start_id=start_id, target_name=prefix)
+                    record = await result.single()
+                    if record:
+                        return record["route"]
+
         return None
-    
+
+    # Add this diagnostic helper to quickly check what the DB actually has:
+    async def search_room_names(self, query_str: str):
+        """Debug: find what names in the DB are close to a query string."""
+        query = """
+        MATCH (s:Space) WHERE toLower(s.name) CONTAINS toLower($q)
+        RETURN s.name AS name, s.poi_id AS id LIMIT 10
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, q=query_str)
+            return [{"name": r["name"], "id": r["id"]} async for r in result]
+
     async def get_random_room_id(self):
             """Fetches a random valid room ID for initial frontend 'cold starts'."""
             query = "MATCH (s:Space) WHERE s.name IS NOT NULL RETURN s.poi_id AS poi_id LIMIT 50"
@@ -138,18 +169,29 @@ def query_navigation_intent(user_input, current_name, nearby_rooms):
     headers = {"Authorization": f"Bearer {CAMPUS_AI_KEY}", "Content-Type": "application/json"}
     nearby_str = ", ".join(nearby_rooms) if nearby_rooms else "None"
 
-    SYSTEM_PROMPT = """You are the spatial reasoning brain for a navigation assistant at DTU.
-RULES:
-1. Decide intent: "navigate" or "info".
-2. If "navigate": set "target" to the destination name. Prefer EXACT words.
-3. If "info": write a conversational answer in "reply" using the Context provided.
-4. "avoid" is a list of hazard types to exclude (e.g., ['stairs', 'elevator']).
-Respond ONLY with valid JSON - no extra text:
+    SYSTEM_PROMPT = """You are the intent-extraction brain for a DTU indoor navigation system.
+Your ONLY job is to classify the user's request and extract parameters.
+
+CRITICAL RULES:
+1. If the user wants to GO somewhere, reach somewhere, find a location, or asks HOW TO GET somewhere → intent MUST be "navigate", NEVER "info".
+2. If the user asks a factual question NOT about going somewhere (e.g., "what floor am I on?", "what is this room?") → intent is "info".
+3. For "navigate": set "target" to the EXACT destination name as the user said it. Do NOT paraphrase.
+4. For "info": write a short factual reply using only the Context provided. NEVER give navigation directions in an info reply.
+5. "avoid" is a list of mobility hazards: e.g., ["stairs"], ["elevator"], or [].
+
+Examples:
+- "how do I get to the canteen" → navigate
+- "take me to glassalen" → navigate  
+- "where is the bathroom" → navigate
+- "what floor am I on" → info
+- "what is this room used for" → info
+
+Respond ONLY with valid JSON, no extra text:
 {
-  "intent":  "navigate",
-  "target":  "destination name",
-  "avoid":   [],
-  "reply":   ""
+  "intent": "navigate",
+  "target": "destination name exactly as user said",
+  "avoid": [],
+  "reply": ""
 }"""
 
     payload = {
@@ -302,20 +344,52 @@ async def process_agent_query(request: AgentQueryRequest):
             target_id=current_id 
         )
 
-    # 3. Fuzzy Match Target
-    target_str = llm_intent.get("target", "")
+    # 3. Fuzzy Match / Name Resolution (tiered approach)
+    target_str = llm_intent.get("target", "").strip()
     hazards_to_avoid = llm_intent.get("avoid", [])
 
-    synonyms = {"library": "bibliotek", "canteen": "kantine", "food": "kantine", "cafe": "kantine"}
-    target_str = synonyms.get(target_str.lower(), target_str)
+    # Strip leading articles before synonym lookup
+    ARTICLES = {"the ", "a ", "an ", "to ", "to the ", "a the "}
+    target_lower = target_str.lower()
+    for article in ARTICLES:
+        if target_lower.startswith(article):
+            target_lower = target_lower[len(article):]
+            break
 
-    best_match = target_str
-    if state.valid_names:
-        matches = difflib.get_close_matches(target_str, state.valid_names, n=1, cutoff=0.45)
-        if matches: best_match = matches[0]
+    # Expand known synonyms (Danish/English)
+    SYNONYMS = {
+        "library": "bibliotek",
+        "canteen": "kantine",
+        "food": "kantine",
+        "cafe": "kantine",
+        "cafeteria": "kantine",
+        "auditorium": "glassalen",   # add known aliases
+        "glass hall": "glassalen",
+        "bathroom": "toilet",
+        "restroom": "toilet",
+        "toilet": "toilet",
+        "elevator": "elevator",
+        "lift": "elevator",
+    }
+    best_match = SYNONYMS.get(target_lower, target_str)
 
-    # 4. Neo4j Cypher Execution
+    # Strategy 1: Try the resolved name directly via Cypher CONTAINS (trust the DB)
     route_nodes = await state.db.find_semantic_route(current_id, best_match, hazards_to_avoid)
+
+    # Strategy 2: If that fails, try fuzzy match against cached names
+    if not route_nodes and state.valid_names:
+        matches = difflib.get_close_matches(best_match, state.valid_names, n=3, cutoff=0.35)
+        for candidate in matches:
+            route_nodes = await state.db.find_semantic_route(current_id, candidate, hazards_to_avoid)
+            if route_nodes:
+                best_match = candidate
+                break
+
+    # Strategy 3: If still nothing, try the original raw user string (LLM may have paraphrased)
+    if not route_nodes and best_match.lower() != target_str.lower():
+        route_nodes = await state.db.find_semantic_route(current_id, target_str, hazards_to_avoid)
+        if route_nodes:
+            best_match = target_str
 
     if not route_nodes:
         return AgentQueryResponse(
@@ -349,6 +423,17 @@ async def process_agent_query(request: AgentQueryRequest):
         instructions=turn_instructions,
         path_coordinates=path_coords
     )
+
+@app.get("/api/v1/debug/search")
+async def debug_search(q: str):
+    """Quick diagnostic: what does Neo4j actually have for a name fragment?"""
+    results = await state.db.search_room_names(q)
+    fuzzy = difflib.get_close_matches(q, state.valid_names, n=5, cutoff=0.3)
+    return {
+        "cypher_contains_matches": results,
+        "fuzzy_matches": fuzzy,
+        "total_cached_names": len(state.valid_names)
+    }
 
 if __name__ == "__main__":
     import uvicorn

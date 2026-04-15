@@ -140,7 +140,7 @@ with col1:
         st.info("Map will appear here once a route is generated.")
 
 with col2:
-    st.subheader("🚶 O&M Guidance")
+    st.subheader("Guidance")
     if st.session_state.current_instructions:
         for step in st.session_state.current_instructions:
             st.write(step)
