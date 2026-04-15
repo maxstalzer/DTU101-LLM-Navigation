@@ -1,0 +1,18 @@
+[project]
+name = "project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "contextily>=1.7.0",
+    "matplotlib>=3.10.8",
+    "neo4j>=6.1.0",
+    "networkx>=3.6.1",
+    "numpy>=2.4.3",
+    "plotly>=6.6.0",
+    "python-dotenv>=1.2.2",
+    "rdflib>=7.6.0",
+    "requests>=2.33.0",
+    "shapely>=2.1.2",
+]
